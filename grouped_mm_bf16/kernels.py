@@ -498,3 +498,559 @@ def grouped_mm_3d2d(mat_a: torch.Tensor, mat_b: torch.Tensor, offs: torch.Tensor
         BLOCK_K=32,
         num_warps=4,
     )
+
+
+@triton.jit
+def _grouped_mm_2d3d_dA_kernel(
+    dC_ptr,
+    B_ptr,
+    dA_ptr,
+    offs_ptr,
+    G: tl.constexpr,
+    M_TOTAL,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_dcm: tl.constexpr,
+    stride_dcn: tl.constexpr,
+    stride_bg: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    stride_dam: tl.constexpr,
+    stride_dak: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_k = tl.program_id(axis=1)
+
+    m = pid_m
+    k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+
+    g = _upper_bound_offs_i32(offs_ptr, G, m.to(tl.int32))
+    b_g = B_ptr + g * stride_bg
+
+    acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    for n0 in tl.static_range(0, N, BLOCK_N):
+        n = n0 + tl.arange(0, BLOCK_N)
+        dc = tl.load(
+            dC_ptr + m * stride_dcm + n * stride_dcn,
+            mask=(m < M_TOTAL) & (n < N),
+            other=0.0,
+        ).to(tl.float32)
+        b = tl.load(
+            b_g + k[:, None] * stride_bk + n[None, :] * stride_bn,
+            mask=(k[:, None] < K) & (n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(b * dc[None, :], axis=1)
+
+    tl.store(
+        dA_ptr + m * stride_dam + k * stride_dak,
+        tl.cast(acc, OUT_DTYPE),
+        mask=(m < M_TOTAL) & (k < K),
+    )
+
+
+@triton.jit
+def _grouped_mm_2d3d_dB_atomic_kernel(
+    A_ptr,
+    dC_ptr,
+    dB_ptr,
+    offs_ptr,
+    G: tl.constexpr,
+    M_TOTAL,
+    N,
+    K: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_dcm: tl.constexpr,
+    stride_dcn: tl.constexpr,
+    stride_dbg: tl.constexpr,
+    stride_dbk: tl.constexpr,
+    stride_dbn: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_mb = tl.program_id(axis=0)
+    pid_kb = tl.program_id(axis=1)
+    pid_nb = tl.program_id(axis=2)
+
+    k = pid_kb * BLOCK_K + tl.arange(0, BLOCK_K)
+    n = pid_nb * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    for r in tl.static_range(0, BLOCK_M):
+        m_r = pid_mb * BLOCK_M + r
+        valid_m = m_r < M_TOTAL
+        g = tl.where(valid_m, _upper_bound_offs_i32(offs_ptr, G, m_r.to(tl.int32)), 0).to(tl.int32)
+        a_r = tl.load(
+            A_ptr + m_r * stride_am + k * stride_ak,
+            mask=valid_m & (k < K),
+            other=0.0,
+        ).to(tl.float32)
+        dc_r = tl.load(
+            dC_ptr + m_r * stride_dcm + n * stride_dcn,
+            mask=valid_m & (n < N),
+            other=0.0,
+        ).to(tl.float32)
+        out_ptr = dB_ptr + g * stride_dbg + k[:, None] * stride_dbk + n[None, :] * stride_dbn
+        contrib = a_r[:, None] * dc_r[None, :]
+        tl.atomic_add(out_ptr, contrib, mask=valid_m & (k[:, None] < K) & (n[None, :] < N))
+
+
+@triton.jit
+def _grouped_mm_3d2d_dB_kernel(
+    A_ptr,
+    dC_ptr,
+    dB_ptr,
+    offs_ptr,
+    G: tl.constexpr,
+    M: tl.constexpr,
+    N_TOTAL,
+    K: tl.constexpr,
+    stride_ag: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_dcm: tl.constexpr,
+    stride_dcn: tl.constexpr,
+    stride_dbk: tl.constexpr,
+    stride_dbn: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_n = tl.program_id(axis=0)
+    pid_k = tl.program_id(axis=1)
+
+    n = pid_n
+    k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+
+    g = _upper_bound_offs_i32(offs_ptr, G, n.to(tl.int32))
+    a_g = A_ptr + g * stride_ag
+
+    acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    for m0 in tl.static_range(0, M, BLOCK_M):
+        m = m0 + tl.arange(0, BLOCK_M)
+        a = tl.load(
+            a_g + m[:, None] * stride_am + k[None, :] * stride_ak,
+            mask=(m[:, None] < M) & (k[None, :] < K),
+            other=0.0,
+        ).to(tl.float32)
+        dc = tl.load(
+            dC_ptr + m * stride_dcm + n * stride_dcn,
+            mask=(m < M) & (n < N_TOTAL),
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(a * dc[:, None], axis=0)
+
+    tl.store(
+        dB_ptr + k * stride_dbk + n * stride_dbn,
+        tl.cast(acc, OUT_DTYPE),
+        mask=(k < K) & (n < N_TOTAL),
+    )
+
+
+@triton.jit
+def _grouped_mm_3d2d_dA_atomic_kernel(
+    dC_ptr,
+    B_ptr,
+    dA_ptr,
+    offs_ptr,
+    G: tl.constexpr,
+    M,
+    N_TOTAL,
+    K: tl.constexpr,
+    stride_dcm: tl.constexpr,
+    stride_dcn: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    stride_dag: tl.constexpr,
+    stride_dam: tl.constexpr,
+    stride_dak: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_n = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+    pid_k = tl.program_id(axis=2)
+
+    n = pid_n
+    m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+
+    g = _upper_bound_offs_i32(offs_ptr, G, n.to(tl.int32))
+
+    dc = tl.load(
+        dC_ptr + m * stride_dcm + n * stride_dcn,
+        mask=(m < M) & (n < N_TOTAL),
+        other=0.0,
+    ).to(tl.float32)
+    b = tl.load(
+        B_ptr + k * stride_bk + n * stride_bn,
+        mask=(k < K) & (n < N_TOTAL),
+        other=0.0,
+    ).to(tl.float32)
+
+    contrib = dc[:, None] * b[None, :]
+    out_ptr = dA_ptr + g * stride_dag + m[:, None] * stride_dam + k[None, :] * stride_dak
+    tl.atomic_add(out_ptr, contrib, mask=(m[:, None] < M) & (k[None, :] < K) & (n < N_TOTAL))
+
+
+@triton.jit
+def _grouped_mm_2d2d_dA_kernel(
+    dC_ptr,
+    B_ptr,
+    dA_ptr,
+    offs_ptr,
+    G: tl.constexpr,
+    M,
+    N: tl.constexpr,
+    K_TOTAL,
+    stride_dcg: tl.constexpr,
+    stride_dcm: tl.constexpr,
+    stride_dcn: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    stride_dam: tl.constexpr,
+    stride_dak: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_k = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+
+    k = pid_k
+    m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+
+    g = _upper_bound_offs_i32(offs_ptr, G, k.to(tl.int32))
+    dc_g = dC_ptr + g * stride_dcg
+
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for n0 in tl.static_range(0, N, BLOCK_N):
+        n = n0 + tl.arange(0, BLOCK_N)
+        dc = tl.load(
+            dc_g + m[:, None] * stride_dcm + n[None, :] * stride_dcn,
+            mask=(m[:, None] < M) & (n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32)
+        b = tl.load(
+            B_ptr + k * stride_bk + n * stride_bn,
+            mask=(k < K_TOTAL) & (n < N),
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(dc * b[None, :], axis=1)
+
+    tl.store(
+        dA_ptr + m * stride_dam + k * stride_dak,
+        tl.cast(acc, OUT_DTYPE),
+        mask=(m < M) & (k < K_TOTAL),
+    )
+
+
+@triton.jit
+def _grouped_mm_2d2d_dB_kernel(
+    A_ptr,
+    dC_ptr,
+    dB_ptr,
+    offs_ptr,
+    G: tl.constexpr,
+    M: tl.constexpr,
+    N,
+    K_TOTAL,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_dcg: tl.constexpr,
+    stride_dcm: tl.constexpr,
+    stride_dcn: tl.constexpr,
+    stride_dbk: tl.constexpr,
+    stride_dbn: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_k = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    k = pid_k
+    n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    g = _upper_bound_offs_i32(offs_ptr, G, k.to(tl.int32))
+    dc_g = dC_ptr + g * stride_dcg
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for m0 in tl.static_range(0, M, BLOCK_M):
+        m = m0 + tl.arange(0, BLOCK_M)
+        a = tl.load(
+            A_ptr + m * stride_am + k * stride_ak,
+            mask=(m < M) & (k < K_TOTAL),
+            other=0.0,
+        ).to(tl.float32)
+        dc = tl.load(
+            dc_g + m[:, None] * stride_dcm + n[None, :] * stride_dcn,
+            mask=(m[:, None] < M) & (n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(a[:, None] * dc, axis=0)
+
+    tl.store(
+        dB_ptr + k * stride_dbk + n * stride_dbn,
+        tl.cast(acc, OUT_DTYPE),
+        mask=(k < K_TOTAL) & (n < N),
+    )
+
+
+def grouped_mm_3d3d_backward(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    grad_out: torch.Tensor,
+    grad_a: Optional[torch.Tensor],
+    grad_b: Optional[torch.Tensor],
+) -> None:
+    G, M, K = mat_a.shape
+    _, _, N = mat_b.shape
+    if grad_a is not None:
+        grid = (triton.cdiv(M, 64), triton.cdiv(K, 64), G)
+        _grouped_mm_3d3d_kernel[grid](
+            grad_out,
+            mat_b,
+            grad_a,
+            M=M,
+            N=K,
+            K=N,
+            stride_ag=grad_out.stride(0),
+            stride_am=grad_out.stride(1),
+            stride_ak=grad_out.stride(2),
+            stride_bg=mat_b.stride(0),
+            stride_bk=mat_b.stride(2),  # treat B as [N, K]
+            stride_bn=mat_b.stride(1),
+            stride_cg=grad_a.stride(0),
+            stride_cm=grad_a.stride(1),
+            stride_cn=grad_a.stride(2),
+            OUT_DTYPE=_as_tl_dtype(grad_a.dtype),
+            BLOCK_M=64,
+            BLOCK_N=64,
+            BLOCK_K=32,
+            num_warps=4,
+        )
+
+    if grad_b is not None:
+        grid = (triton.cdiv(K, 64), triton.cdiv(N, 64), G)
+        _grouped_mm_3d3d_kernel[grid](
+            mat_a,
+            grad_out,
+            grad_b,
+            M=K,
+            N=N,
+            K=M,
+            stride_ag=mat_a.stride(0),
+            stride_am=mat_a.stride(2),  # treat A as [K, M]
+            stride_ak=mat_a.stride(1),
+            stride_bg=grad_out.stride(0),
+            stride_bk=grad_out.stride(1),
+            stride_bn=grad_out.stride(2),
+            stride_cg=grad_b.stride(0),
+            stride_cm=grad_b.stride(1),
+            stride_cn=grad_b.stride(2),
+            OUT_DTYPE=_as_tl_dtype(grad_b.dtype),
+            BLOCK_M=64,
+            BLOCK_N=64,
+            BLOCK_K=32,
+            num_warps=4,
+        )
+
+
+def grouped_mm_2d3d_backward(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    offs: torch.Tensor,
+    grad_out: torch.Tensor,
+    grad_a: Optional[torch.Tensor],
+    grad_b: Optional[torch.Tensor],
+) -> None:
+    G = offs.numel()
+    M_TOTAL, K = mat_a.shape
+    _, _, N = mat_b.shape
+    if grad_a is not None:
+        grid = (M_TOTAL, triton.cdiv(K, 128))
+        _grouped_mm_2d3d_dA_kernel[grid](
+            grad_out,
+            mat_b,
+            grad_a,
+            offs,
+            G=G,
+            M_TOTAL=M_TOTAL,
+            N=N,
+            K=K,
+            stride_dcm=grad_out.stride(0),
+            stride_dcn=grad_out.stride(1),
+            stride_bg=mat_b.stride(0),
+            stride_bk=mat_b.stride(1),
+            stride_bn=mat_b.stride(2),
+            stride_dam=grad_a.stride(0),
+            stride_dak=grad_a.stride(1),
+            OUT_DTYPE=_as_tl_dtype(grad_a.dtype),
+            BLOCK_K=128,
+            BLOCK_N=32,
+            num_warps=4,
+        )
+
+    if grad_b is not None:
+        dB_fp32 = torch.zeros((G, K, N), device=mat_a.device, dtype=torch.float32)
+        grid = (
+            triton.cdiv(M_TOTAL, 8),
+            triton.cdiv(K, 32),
+            triton.cdiv(N, 32),
+        )
+        _grouped_mm_2d3d_dB_atomic_kernel[grid](
+            mat_a,
+            grad_out,
+            dB_fp32,
+            offs,
+            G=G,
+            M_TOTAL=M_TOTAL,
+            N=N,
+            K=K,
+            stride_am=mat_a.stride(0),
+            stride_ak=mat_a.stride(1),
+            stride_dcm=grad_out.stride(0),
+            stride_dcn=grad_out.stride(1),
+            stride_dbg=dB_fp32.stride(0),
+            stride_dbk=dB_fp32.stride(1),
+            stride_dbn=dB_fp32.stride(2),
+            BLOCK_M=8,
+            BLOCK_K=32,
+            BLOCK_N=32,
+            num_warps=4,
+        )
+        grad_b.copy_(dB_fp32.to(dtype=grad_b.dtype))
+
+
+def grouped_mm_3d2d_backward(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    offs: torch.Tensor,
+    grad_out: torch.Tensor,
+    grad_a: Optional[torch.Tensor],
+    grad_b: Optional[torch.Tensor],
+) -> None:
+    G = offs.numel()
+    G_a, M, K = mat_a.shape
+    _, N_TOTAL = mat_b.shape
+    if G_a != G:
+        raise RuntimeError("matrix batch sizes have to match")
+
+    if grad_b is not None:
+        grid = (N_TOTAL, triton.cdiv(K, 128))
+        _grouped_mm_3d2d_dB_kernel[grid](
+            mat_a,
+            grad_out,
+            grad_b,
+            offs,
+            G=G,
+            M=M,
+            N_TOTAL=N_TOTAL,
+            K=K,
+            stride_ag=mat_a.stride(0),
+            stride_am=mat_a.stride(1),
+            stride_ak=mat_a.stride(2),
+            stride_dcm=grad_out.stride(0),
+            stride_dcn=grad_out.stride(1),
+            stride_dbk=grad_b.stride(0),
+            stride_dbn=grad_b.stride(1),
+            OUT_DTYPE=_as_tl_dtype(grad_b.dtype),
+            BLOCK_M=32,
+            BLOCK_K=128,
+            num_warps=4,
+        )
+
+    if grad_a is not None:
+        dA_fp32 = torch.zeros((G, M, K), device=mat_a.device, dtype=torch.float32)
+        grid = (
+            N_TOTAL,
+            triton.cdiv(M, 16),
+            triton.cdiv(K, 32),
+        )
+        _grouped_mm_3d2d_dA_atomic_kernel[grid](
+            grad_out,
+            mat_b,
+            dA_fp32,
+            offs,
+            G=G,
+            M=M,
+            N_TOTAL=N_TOTAL,
+            K=K,
+            stride_dcm=grad_out.stride(0),
+            stride_dcn=grad_out.stride(1),
+            stride_bk=mat_b.stride(0),
+            stride_bn=mat_b.stride(1),
+            stride_dag=dA_fp32.stride(0),
+            stride_dam=dA_fp32.stride(1),
+            stride_dak=dA_fp32.stride(2),
+            BLOCK_M=16,
+            BLOCK_K=32,
+            num_warps=4,
+        )
+        grad_a.copy_(dA_fp32.to(dtype=grad_a.dtype))
+
+
+def grouped_mm_2d2d_backward(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    offs: torch.Tensor,
+    grad_out: torch.Tensor,
+    grad_a: Optional[torch.Tensor],
+    grad_b: Optional[torch.Tensor],
+) -> None:
+    G = offs.numel()
+    M, K_TOTAL = mat_a.shape
+    _, N = mat_b.shape
+
+    if grad_a is not None:
+        grid = (K_TOTAL, triton.cdiv(M, 128))
+        _grouped_mm_2d2d_dA_kernel[grid](
+            grad_out,
+            mat_b,
+            grad_a,
+            offs,
+            G=G,
+            M=M,
+            N=N,
+            K_TOTAL=K_TOTAL,
+            stride_dcg=grad_out.stride(0),
+            stride_dcm=grad_out.stride(1),
+            stride_dcn=grad_out.stride(2),
+            stride_bk=mat_b.stride(0),
+            stride_bn=mat_b.stride(1),
+            stride_dam=grad_a.stride(0),
+            stride_dak=grad_a.stride(1),
+            OUT_DTYPE=_as_tl_dtype(grad_a.dtype),
+            BLOCK_M=128,
+            BLOCK_N=32,
+            num_warps=4,
+        )
+
+    if grad_b is not None:
+        grid = (K_TOTAL, triton.cdiv(N, 128))
+        _grouped_mm_2d2d_dB_kernel[grid](
+            mat_a,
+            grad_out,
+            grad_b,
+            offs,
+            G=G,
+            M=M,
+            N=N,
+            K_TOTAL=K_TOTAL,
+            stride_am=mat_a.stride(0),
+            stride_ak=mat_a.stride(1),
+            stride_dcg=grad_out.stride(0),
+            stride_dcm=grad_out.stride(1),
+            stride_dcn=grad_out.stride(2),
+            stride_dbk=grad_b.stride(0),
+            stride_dbn=grad_b.stride(1),
+            OUT_DTYPE=_as_tl_dtype(grad_b.dtype),
+            BLOCK_M=32,
+            BLOCK_N=128,
+            num_warps=4,
+        )

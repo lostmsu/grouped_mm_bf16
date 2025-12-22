@@ -7,9 +7,13 @@ import torch
 
 from .kernels import (
     grouped_mm_2d2d,
+    grouped_mm_2d2d_backward,
     grouped_mm_2d3d,
+    grouped_mm_2d3d_backward,
     grouped_mm_3d2d,
+    grouped_mm_3d2d_backward,
     grouped_mm_3d3d,
+    grouped_mm_3d3d_backward,
 )
 
 
@@ -28,26 +32,18 @@ def _check_valid_strides_and_return_transposed(mat: torch.Tensor) -> bool:
     if mat.dim() not in (2, 3):
         raise RuntimeError(f"mat must be 2D or 3D, got dim={mat.dim()}")
 
-    if (mat.data_ptr() % 16) != 0:
-        raise RuntimeError("expected data_ptr to be aligned to 16 bytes")
-
     end_dim = mat.dim() - 1
     stride_m = mat.stride(end_dim - 1)
     stride_n = mat.stride(end_dim)
     size_m = mat.size(end_dim - 1)
     size_n = mat.size(end_dim)
-    alignment = 16 // mat.element_size()
 
     # Row-major: last dim contiguous
     if stride_n == 1 and stride_m >= max(1, size_n):
-        if (stride_m % alignment) != 0:
-            raise RuntimeError("strides should be multiple of 16 bytes")
         return True
 
     # Column-major: second-to-last dim contiguous
     if stride_m == 1 and stride_n >= max(1, size_m):
-        if (stride_n % alignment) != 0:
-            raise RuntimeError("strides should be multiple of 16 bytes")
         return False
 
     raise RuntimeError(
@@ -167,6 +163,115 @@ def _create_output(
     return torch.empty_strided(out_size, strides, device=mat_a.device, dtype=out_dtype)
 
 
+class _GroupedMMFn(torch.autograd.Function):
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx,
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        offs: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        out_dtype: Optional[torch.dtype],
+    ) -> torch.Tensor:
+        v = _validate_inputs(mat_a, mat_b, offs, bias, out_dtype)
+        out = _create_output(mat_a, mat_b, offs, v.out_dtype)
+
+        ctx.a_is_2d = v.a_is_2d
+        ctx.b_is_2d = v.b_is_2d
+        ctx.has_offs = offs is not None
+        ctx.save_for_backward(
+            mat_a,
+            mat_b,
+            offs if offs is not None else torch.empty((), device=mat_a.device, dtype=torch.int32),
+        )
+
+        if out.numel() == 0:
+            return out
+
+        if (not v.a_is_2d) and (not v.b_is_2d):
+            if mat_a.size(2) == 0:
+                out.zero_()
+                return out
+            grouped_mm_3d3d(mat_a, mat_b, out)
+            return out
+        if v.a_is_2d and v.b_is_2d:
+            if mat_a.size(1) == 0:
+                out.zero_()
+                return out
+            grouped_mm_2d2d(mat_a, mat_b, offs, out)
+            return out
+        if v.a_is_2d and (not v.b_is_2d):
+            if mat_a.size(1) == 0:
+                out.zero_()
+                return out
+            grouped_mm_2d3d(mat_a, mat_b, offs, out)
+            return out
+        # 3d x 2d
+        if mat_a.size(2) == 0:
+            out.zero_()
+            return out
+        grouped_mm_3d2d(mat_a, mat_b, offs, out)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):  # type: ignore[override]
+        mat_a, mat_b, offs_or_empty = ctx.saved_tensors
+        offs = offs_or_empty if ctx.has_offs else None
+
+        if grad_out.numel() == 0:
+            grad_a = torch.zeros_like(mat_a) if ctx.needs_input_grad[0] else None
+            grad_b = torch.zeros_like(mat_b) if ctx.needs_input_grad[1] else None
+            return grad_a, grad_b, None, None, None
+
+        try:
+            _check_valid_strides_and_return_transposed(grad_out)
+        except Exception:
+            grad_out = grad_out.contiguous()
+
+        grad_a = torch.empty_like(mat_a) if ctx.needs_input_grad[0] else None
+        grad_b = torch.empty_like(mat_b) if ctx.needs_input_grad[1] else None
+
+        if (not ctx.a_is_2d) and (not ctx.b_is_2d):
+            if mat_a.size(2) == 0:
+                if grad_a is not None:
+                    grad_a.zero_()
+                if grad_b is not None:
+                    grad_b.zero_()
+                return grad_a, grad_b, None, None, None
+            grouped_mm_3d3d_backward(mat_a, mat_b, grad_out, grad_a, grad_b)
+            return grad_a, grad_b, None, None, None
+
+        if ctx.a_is_2d and ctx.b_is_2d:
+            if mat_a.size(1) == 0:
+                if grad_a is not None:
+                    grad_a.zero_()
+                if grad_b is not None:
+                    grad_b.zero_()
+                return grad_a, grad_b, None, None, None
+            grouped_mm_2d2d_backward(mat_a, mat_b, offs, grad_out, grad_a, grad_b)
+            return grad_a, grad_b, None, None, None
+
+        if ctx.a_is_2d and (not ctx.b_is_2d):
+            if mat_a.size(1) == 0:
+                if grad_a is not None:
+                    grad_a.zero_()
+                if grad_b is not None:
+                    grad_b.zero_()
+                return grad_a, grad_b, None, None, None
+            grouped_mm_2d3d_backward(mat_a, mat_b, offs, grad_out, grad_a, grad_b)
+            return grad_a, grad_b, None, None, None
+
+        # 3d x 2d
+        if mat_a.size(2) == 0:
+            if grad_a is not None:
+                grad_a.zero_()
+            if grad_b is not None:
+                grad_b.zero_()
+            return grad_a, grad_b, None, None, None
+        grouped_mm_3d2d_backward(mat_a, mat_b, offs, grad_out, grad_a, grad_b)
+        return grad_a, grad_b, None, None, None
+
+
 def grouped_mm(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
@@ -176,35 +281,7 @@ def grouped_mm(
 ) -> torch.Tensor:
     """
     Triton GPU-only implementation of `torch.nn.functional.grouped_mm` semantics
-    (matches the private operator signature: `torch._grouped_mm`).
+    (matches the private operator signature: `torch._grouped_mm`), including backprop.
     """
-    v = _validate_inputs(mat_a, mat_b, offs, bias, out_dtype)
-    out = _create_output(mat_a, mat_b, offs, v.out_dtype)
 
-    if out.numel() == 0:
-        return out
-
-    if (not v.a_is_2d) and (not v.b_is_2d):
-        if mat_a.size(2) == 0:
-            out.zero_()
-            return out
-        grouped_mm_3d3d(mat_a, mat_b, out)
-        return out
-    if v.a_is_2d and v.b_is_2d:
-        if mat_a.size(1) == 0:
-            out.zero_()
-            return out
-        grouped_mm_2d2d(mat_a, mat_b, offs, out)
-        return out
-    if v.a_is_2d and (not v.b_is_2d):
-        if mat_a.size(1) == 0:
-            out.zero_()
-            return out
-        grouped_mm_2d3d(mat_a, mat_b, offs, out)
-        return out
-    # 3d x 2d
-    if mat_a.size(2) == 0:
-        out.zero_()
-        return out
-    grouped_mm_3d2d(mat_a, mat_b, offs, out)
-    return out
+    return _GroupedMMFn.apply(mat_a, mat_b, offs, bias, out_dtype)
