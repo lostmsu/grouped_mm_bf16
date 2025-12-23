@@ -4,6 +4,7 @@ from typing import Optional
 
 import os
 import sys
+from functools import lru_cache
 
 import torch
 
@@ -181,6 +182,18 @@ def _as_tl_dtype(dtype: torch.dtype):
     raise RuntimeError(f"Unsupported dtype: {dtype}")
 
 
+@lru_cache(maxsize=1)
+def _allow_tf32() -> bool:
+    # Match PyTorch's matmul precision knob on NVIDIA.
+    # Triton may use TF32 for fp32 dot by default; on ROCm there is no TF32 path.
+    if getattr(torch.version, "hip", None) is not None:
+        return False
+    try:
+        return bool(torch.backends.cuda.matmul.allow_tf32)
+    except Exception:
+        return False
+
+
 @triton.jit
 def _grouped_mm_3d3d_kernel(
     A_ptr,
@@ -199,6 +212,7 @@ def _grouped_mm_3d3d_kernel(
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -225,7 +239,7 @@ def _grouped_mm_3d3d_kernel(
             mask=(k[:, None] < K) & (n[None, :] < N),
             other=0.0,
         )
-        acc = tl.dot(a, b, acc=acc)
+        acc = tl.dot(a, b, acc=acc, allow_tf32=ALLOW_TF32)
 
     c = C_ptr + pid_g * stride_cg + m[:, None] * stride_cm + n[None, :] * stride_cn
     tl.store(c, tl.cast(acc, OUT_DTYPE), mask=(m[:, None] < M) & (n[None, :] < N))
@@ -249,6 +263,7 @@ def _grouped_mm_2d2d_kernel(
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -280,7 +295,7 @@ def _grouped_mm_2d2d_kernel(
             mask=k_in[:, None] & (k_glob[:, None] < K_TOTAL) & (n[None, :] < N),
             other=0.0,
         )
-        acc = tl.dot(a, b, acc=acc)
+        acc = tl.dot(a, b, acc=acc, allow_tf32=ALLOW_TF32)
 
     c = C_ptr + pid_g * stride_cg + m[:, None] * stride_cm + n[None, :] * stride_cn
     tl.store(c, tl.cast(acc, OUT_DTYPE), mask=(m[:, None] < M) & (n[None, :] < N))
@@ -304,6 +319,7 @@ def _grouped_mm_2d3d_prologue_main_kernel(
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -337,7 +353,7 @@ def _grouped_mm_2d3d_prologue_main_kernel(
             mask=valid_g & (k[:, None] < K) & (n[None, :] < N),
             other=0.0,
         )
-        acc = tl.dot(a, b, acc=acc)
+        acc = tl.dot(a, b, acc=acc, allow_tf32=ALLOW_TF32)
 
     c = C_ptr + m[:, None] * stride_cm + n[None, :] * stride_cn
     # Store all rows; rows outside `valid_row` are zero because `a` is masked to 0.
@@ -362,6 +378,7 @@ def _grouped_mm_2d3d_prologue_kernel(
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -396,7 +413,7 @@ def _grouped_mm_2d3d_prologue_kernel(
                 mask=(k[:, None] < K) & (n[None, :] < N),
                 other=0.0,
             )
-            acc = tl.dot(a, b, acc=acc)
+            acc = tl.dot(a, b, acc=acc, allow_tf32=ALLOW_TF32)
 
         c = C_ptr + m[:, None] * stride_cm + n[None, :] * stride_cn
         tl.store(c, tl.cast(acc, OUT_DTYPE), mask=valid_row[:, None] & (n[None, :] < N))
@@ -420,6 +437,7 @@ def _grouped_mm_2d3d_rowwise_kernel(
     stride_cm: tl.constexpr,
     stride_cn: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -448,7 +466,7 @@ def _grouped_mm_2d3d_rowwise_kernel(
             mask=valid_g & (k[:, None] < K) & (n[None, :] < N),
             other=0.0,
         )
-        acc = tl.dot(a[None, :], b, acc=acc)
+        acc = tl.dot(a[None, :], b, acc=acc, allow_tf32=ALLOW_TF32)
 
     c = C_ptr + m * stride_cm + n[None, :] * stride_cn
     tl.store(c, tl.cast(acc, OUT_DTYPE), mask=valid_g & (m < M_TOTAL) & (n[None, :] < N))
@@ -524,6 +542,7 @@ def grouped_mm_3d3d(mat_a: torch.Tensor, mat_b: torch.Tensor, out: torch.Tensor)
         stride_cm=out.stride(1),
         stride_cn=out.stride(2),
         OUT_DTYPE=_as_tl_dtype(out.dtype),
+        ALLOW_TF32=_allow_tf32(),
         BLOCK_M=64,
         BLOCK_N=64,
         BLOCK_K=32,
@@ -553,6 +572,7 @@ def grouped_mm_2d2d(mat_a: torch.Tensor, mat_b: torch.Tensor, offs: torch.Tensor
         stride_cm=out.stride(1),
         stride_cn=out.stride(2),
         OUT_DTYPE=_as_tl_dtype(out.dtype),
+        ALLOW_TF32=_allow_tf32(),
         BLOCK_M=64,
         BLOCK_N=64,
         BLOCK_K=32,
@@ -592,6 +612,7 @@ def grouped_mm_2d3d(mat_a: torch.Tensor, mat_b: torch.Tensor, offs: torch.Tensor
             stride_cm=out.stride(0),
             stride_cn=out.stride(1),
             OUT_DTYPE=_as_tl_dtype(out.dtype),
+            ALLOW_TF32=_allow_tf32(),
             BLOCK_N=block_n,
             BLOCK_K=block_k,
             num_warps=num_warps,
@@ -630,6 +651,7 @@ def grouped_mm_2d3d(mat_a: torch.Tensor, mat_b: torch.Tensor, offs: torch.Tensor
             stride_cm=out.stride(0),
             stride_cn=out.stride(1),
             OUT_DTYPE=_as_tl_dtype(out.dtype),
+            ALLOW_TF32=_allow_tf32(),
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
@@ -654,6 +676,7 @@ def grouped_mm_2d3d(mat_a: torch.Tensor, mat_b: torch.Tensor, offs: torch.Tensor
             stride_cm=out.stride(0),
             stride_cn=out.stride(1),
             OUT_DTYPE=_as_tl_dtype(out.dtype),
+            ALLOW_TF32=_allow_tf32(),
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
@@ -712,6 +735,7 @@ def _grouped_mm_2d3d_dA_prologue_main_kernel(
     stride_dam: tl.constexpr,
     stride_dak: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -744,7 +768,7 @@ def _grouped_mm_2d3d_dA_prologue_main_kernel(
             mask=valid_g & (k[None, :] < K) & (n[:, None] < N),
             other=0.0,
         )
-        acc = tl.dot(dc, bT, acc=acc)
+        acc = tl.dot(dc, bT, acc=acc, allow_tf32=ALLOW_TF32)
 
     out_ptr = dA_ptr + m[:, None] * stride_dam + k[None, :] * stride_dak
     tl.store(out_ptr, tl.cast(acc, OUT_DTYPE), mask=valid_g & (m[:, None] < M_TOTAL) & (k[None, :] < K))
@@ -768,6 +792,7 @@ def _grouped_mm_2d3d_dA_prologue_kernel(
     stride_dam: tl.constexpr,
     stride_dak: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -802,7 +827,7 @@ def _grouped_mm_2d3d_dA_prologue_kernel(
                 mask=(k[None, :] < K) & (n[:, None] < N),
                 other=0.0,
             )
-            acc = tl.dot(dc, bT, acc=acc)
+            acc = tl.dot(dc, bT, acc=acc, allow_tf32=ALLOW_TF32)
 
         out_ptr = dA_ptr + m[:, None] * stride_dam + k[None, :] * stride_dak
         tl.store(out_ptr, tl.cast(acc, OUT_DTYPE), mask=valid_row[:, None] & (k[None, :] < K))
@@ -825,6 +850,7 @@ def _grouped_mm_2d3d_dB_reduce_kernel(
     stride_dbg: tl.constexpr,
     stride_dbk: tl.constexpr,
     stride_dbn: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -855,7 +881,7 @@ def _grouped_mm_2d3d_dB_reduce_kernel(
             mask=mask_m[:, None] & (n[None, :] < N),
             other=0.0,
         )
-        acc = tl.dot(aT, dc, acc=acc)
+        acc = tl.dot(aT, dc, acc=acc, allow_tf32=ALLOW_TF32)
         m0 += BLOCK_M
 
     out_ptr = dB_ptr + g * stride_dbg + k[:, None] * stride_dbk + n[None, :] * stride_dbn
@@ -1092,6 +1118,7 @@ def grouped_mm_3d3d_backward(
             stride_cm=grad_a.stride(1),
             stride_cn=grad_a.stride(2),
             OUT_DTYPE=_as_tl_dtype(grad_a.dtype),
+            ALLOW_TF32=_allow_tf32(),
             BLOCK_M=64,
             BLOCK_N=64,
             BLOCK_K=32,
@@ -1117,6 +1144,7 @@ def grouped_mm_3d3d_backward(
             stride_cm=grad_b.stride(1),
             stride_cn=grad_b.stride(2),
             OUT_DTYPE=_as_tl_dtype(grad_b.dtype),
+            ALLOW_TF32=_allow_tf32(),
             BLOCK_M=64,
             BLOCK_N=64,
             BLOCK_K=32,
@@ -1135,6 +1163,9 @@ def grouped_mm_2d3d_backward(
     G = offs.numel()
     M_TOTAL, K = mat_a.shape
     _, _, N = mat_b.shape
+
+    allow_tf32 = _allow_tf32()
+
     if grad_a is not None:
         impl = os.getenv("GROUPED_MM_2D3D_IMPL", "prologue").strip().lower()
         if impl in ("hybrid", "tiled"):
@@ -1164,6 +1195,7 @@ def grouped_mm_2d3d_backward(
                 stride_dam=grad_a.stride(0),
                 stride_dak=grad_a.stride(1),
                 OUT_DTYPE=_as_tl_dtype(grad_a.dtype),
+                ALLOW_TF32=allow_tf32,
                 BLOCK_M=block_m,
                 BLOCK_K=block_k,
                 BLOCK_N=block_n,
@@ -1187,6 +1219,7 @@ def grouped_mm_2d3d_backward(
                 stride_dam=grad_a.stride(0),
                 stride_dak=grad_a.stride(1),
                 OUT_DTYPE=_as_tl_dtype(grad_a.dtype),
+                ALLOW_TF32=allow_tf32,
                 BLOCK_M=block_m,
                 BLOCK_K=block_k,
                 BLOCK_N=block_n,
@@ -1219,6 +1252,7 @@ def grouped_mm_2d3d_backward(
             stride_dbg=dB_fp32.stride(0),
             stride_dbk=dB_fp32.stride(1),
             stride_dbn=dB_fp32.stride(2),
+            ALLOW_TF32=allow_tf32,
             BLOCK_M=block_m,
             BLOCK_K=block_k,
             BLOCK_N=block_n,
