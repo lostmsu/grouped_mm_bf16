@@ -846,16 +846,15 @@ def _grouped_mm_2d3d_dA_tiled_boundary_kernel(
 
 
 @triton.jit
-def _grouped_mm_2d3d_dB_atomic_tiled_clean_kernel(
+def _grouped_mm_2d3d_dB_reduce_kernel(
     A_ptr,
     dC_ptr,
     dB_ptr,
     offs_ptr,
-    boundary_mask_ptr,
     G: tl.constexpr,
     M_TOTAL,
     N,
-    K: tl.constexpr,
+    K,
     stride_am: tl.constexpr,
     stride_ak: tl.constexpr,
     stride_dcm: tl.constexpr,
@@ -867,87 +866,37 @@ def _grouped_mm_2d3d_dB_atomic_tiled_clean_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    pid_mb = tl.program_id(axis=0)
-    pid_kb = tl.program_id(axis=1)
-    pid_nb = tl.program_id(axis=2)
+    pid_g = tl.program_id(axis=0)
+    pid_k = tl.program_id(axis=1)
+    pid_n = tl.program_id(axis=2)
 
-    tile_start = pid_mb * BLOCK_M
-    k = pid_kb * BLOCK_K + tl.arange(0, BLOCK_K)
-    n = pid_nb * BLOCK_N + tl.arange(0, BLOCK_N)
-    is_boundary = tl.load(boundary_mask_ptr + pid_mb).to(tl.int32) != 0
+    g = pid_g.to(tl.int32)
+    k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    m = tile_start + tl.arange(0, BLOCK_M)
-    mask_m = m < tl.minimum(tile_start + BLOCK_M, M_TOTAL)
-    g = _upper_bound_offs_i32(offs_ptr, G, tile_start.to(tl.int32)).to(tl.int32)
-    valid_g = g < G
-    g_safe = tl.where(valid_g, g, 0).to(tl.int32)
+    end = tl.load(offs_ptr + g, mask=g < G, other=0).to(tl.int32)
+    start = tl.load(offs_ptr + g - 1, mask=g > 0, other=0).to(tl.int32)
 
-    a = tl.load(
-        A_ptr + m[None, :] * stride_am + k[:, None] * stride_ak,
-        mask=mask_m[None, :] & (k[:, None] < K),
-        other=0.0,
-    )
-    dc = tl.load(
-        dC_ptr + m[:, None] * stride_dcm + n[None, :] * stride_dcn,
-        mask=mask_m[:, None] & (n[None, :] < N),
-        other=0.0,
-    )
-    contrib = tl.dot(a, dc)
-    out_ptr = dB_ptr + g_safe * stride_dbg + k[:, None] * stride_dbk + n[None, :] * stride_dbn
-    tl.atomic_add(out_ptr, contrib, mask=(~is_boundary) & valid_g & (k[:, None] < K) & (n[None, :] < N))
-
-
-@triton.jit
-def _grouped_mm_2d3d_dB_atomic_tiled_boundary_kernel(
-    A_ptr,
-    dC_ptr,
-    dB_ptr,
-    offs_ptr,
-    boundary_tile_ids_ptr,
-    G: tl.constexpr,
-    M_TOTAL,
-    N,
-    K: tl.constexpr,
-    stride_am: tl.constexpr,
-    stride_ak: tl.constexpr,
-    stride_dcm: tl.constexpr,
-    stride_dcn: tl.constexpr,
-    stride_dbg: tl.constexpr,
-    stride_dbk: tl.constexpr,
-    stride_dbn: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    pid_bt = tl.program_id(axis=0)
-    pid_kb = tl.program_id(axis=1)
-    pid_nb = tl.program_id(axis=2)
-
-    tile_id = tl.load(boundary_tile_ids_ptr + pid_bt).to(tl.int32)
-    tile_start = tile_id * BLOCK_M
-    k = pid_kb * BLOCK_K + tl.arange(0, BLOCK_K)
-    n = pid_nb * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    for r in tl.static_range(0, BLOCK_M):
-        m_r = tile_start + r
-        valid_m = m_r < M_TOTAL
-        g = _upper_bound_offs_i32(offs_ptr, G, m_r.to(tl.int32)).to(tl.int32)
-        valid_g = g < G
-        g_safe = tl.where(valid_g, g, 0).to(tl.int32)
-
-        a_r = tl.load(
-            A_ptr + m_r * stride_am + k[:, None] * stride_ak,
-            mask=valid_m & (k[:, None] < K),
+    acc = tl.zeros((BLOCK_K, BLOCK_N), dtype=tl.float32)
+    m0 = start
+    while m0 < end:
+        m = m0 + tl.arange(0, BLOCK_M)
+        mask_m = m < end
+        aT = tl.load(
+            A_ptr + m[None, :] * stride_am + k[:, None] * stride_ak,
+            mask=mask_m[None, :] & (k[:, None] < K),
             other=0.0,
         )
-        dc_r = tl.load(
-            dC_ptr + m_r * stride_dcm + n[None, :] * stride_dcn,
-            mask=valid_m & (n[None, :] < N),
+        dc = tl.load(
+            dC_ptr + m[:, None] * stride_dcm + n[None, :] * stride_dcn,
+            mask=mask_m[:, None] & (n[None, :] < N),
             other=0.0,
         )
-        out_ptr = dB_ptr + g_safe * stride_dbg + k[:, None] * stride_dbk + n[None, :] * stride_dbn
-        contrib = a_r.to(tl.float32) * dc_r.to(tl.float32)
-        tl.atomic_add(out_ptr, contrib, mask=valid_m & valid_g & (k[:, None] < K) & (n[None, :] < N))
+        acc = tl.dot(aT, dc, acc=acc)
+        m0 += BLOCK_M
+
+    out_ptr = dB_ptr + g * stride_dbg + k[:, None] * stride_dbk + n[None, :] * stride_dbn
+    tl.store(out_ptr, acc, mask=(g < G) & (k[:, None] < K) & (n[None, :] < N))
 
 
 @triton.jit
@@ -1281,18 +1230,17 @@ def grouped_mm_2d3d_backward(
 
     if grad_b is not None:
         dB_fp32 = torch.zeros((G, K, N), device=mat_a.device, dtype=torch.float32)
-        block_m = 32
+
+        # dB[g] = A_g^T @ dC_g (per-expert reduction, avoids ~O(M_total) atomics).
+        block_m = 64
         block_k = 32
-        block_n = 32
-        num_warps = 4
-        boundary_mask, boundary_tile_ids = _boundary_tiles_for_block_m(offs, block_m, M_TOTAL)
-        grid = (triton.cdiv(M_TOTAL, block_m), triton.cdiv(K, block_k), triton.cdiv(N, block_n))
-        _grouped_mm_2d3d_dB_atomic_tiled_clean_kernel[grid](
+        block_n = 64
+        grid = (G, triton.cdiv(K, block_k), triton.cdiv(N, block_n))
+        _grouped_mm_2d3d_dB_reduce_kernel[grid](
             mat_a,
             grad_out,
             dB_fp32,
             offs,
-            boundary_mask,
             G=G,
             M_TOTAL=M_TOTAL,
             N=N,
@@ -1307,32 +1255,8 @@ def grouped_mm_2d3d_backward(
             BLOCK_M=block_m,
             BLOCK_K=block_k,
             BLOCK_N=block_n,
-            num_warps=num_warps,
+            num_warps=4,
         )
-        if boundary_tile_ids.numel() != 0:
-            grid_b = (int(boundary_tile_ids.numel()), triton.cdiv(K, block_k), triton.cdiv(N, block_n))
-            _grouped_mm_2d3d_dB_atomic_tiled_boundary_kernel[grid_b](
-                mat_a,
-                grad_out,
-                dB_fp32,
-                offs,
-                boundary_tile_ids,
-                G=G,
-                M_TOTAL=M_TOTAL,
-                N=N,
-                K=K,
-                stride_am=mat_a.stride(0),
-                stride_ak=mat_a.stride(1),
-                stride_dcm=grad_out.stride(0),
-                stride_dcn=grad_out.stride(1),
-                stride_dbg=dB_fp32.stride(0),
-                stride_dbk=dB_fp32.stride(1),
-                stride_dbn=dB_fp32.stride(2),
-                BLOCK_M=block_m,
-                BLOCK_K=block_k,
-                BLOCK_N=block_n,
-                num_warps=num_warps,
-            )
         grad_b.copy_(dB_fp32.to(dtype=grad_b.dtype))
 
 

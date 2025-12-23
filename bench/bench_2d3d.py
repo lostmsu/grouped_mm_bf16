@@ -13,6 +13,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from grouped_mm_bf16 import grouped_mm
+from grouped_mm_bf16.kernels import grouped_mm_2d3d_backward
 
 
 def _device() -> torch.device:
@@ -31,6 +32,39 @@ def _time_forward(
     start = time.perf_counter()
     for _ in range(iters):
         grouped_mm(a, b, offs=offs)
+    torch.cuda.synchronize()
+    end = time.perf_counter()
+    return (end - start) / iters * 1e3
+
+
+def _time_backward_da_db(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    offs: torch.Tensor,
+    grad_out: torch.Tensor,
+    *,
+    compute_grad_a: bool,
+    compute_grad_b: bool,
+    iters: int,
+    warmup: int,
+) -> float:
+    if compute_grad_a:
+        grad_a = torch.empty_like(a)
+    else:
+        grad_a = None
+
+    if compute_grad_b:
+        grad_b = torch.empty_like(b)
+    else:
+        grad_b = None
+
+    for _ in range(warmup):
+        grouped_mm_2d3d_backward(a, b, offs, grad_out, grad_a, grad_b)
+    torch.cuda.synchronize()
+
+    start = time.perf_counter()
+    for _ in range(iters):
+        grouped_mm_2d3d_backward(a, b, offs, grad_out, grad_a, grad_b)
     torch.cuda.synchronize()
     end = time.perf_counter()
     return (end - start) / iters * 1e3
@@ -63,6 +97,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for reproducible benchmarks")
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--mode", type=str, default="forward", choices=["forward", "backward", "both"])
+    parser.add_argument("--backward", type=str, default="both", choices=["da", "db", "both"])
     parser.add_argument("--impl", type=str, default="both", choices=["tiled", "hybrid", "rowwise", "both"])
     parser.add_argument("--block-m", type=int, default=None)
     parser.add_argument("--block-n", type=int, default=None)
@@ -104,6 +140,7 @@ def main() -> None:
 
     a = torch.randn((total_routed_tokens, embedding_size), device=dev, dtype=dtype)
     b = torch.randn((experts, embedding_size, output_features), device=dev, dtype=dtype)
+    grad_out = torch.randn((total_routed_tokens, output_features), device=dev, dtype=dtype)
 
     if args.impl == "hybrid":
         args.impl = "tiled"
@@ -138,19 +175,45 @@ def main() -> None:
                 os.environ["GROUPED_MM_2D3D_ROWWISE_BLOCK_K"] = str(args.rowwise_block_k)
             if args.rowwise_num_warps is not None:
                 os.environ["GROUPED_MM_2D3D_ROWWISE_NUM_WARPS"] = str(args.rowwise_num_warps)
-        ms = _time_forward(a, b, offs, iters=args.iters, warmup=args.warmup)
-        flops = 2 * total_routed_tokens * embedding_size * output_features
-        tflops = flops / (ms / 1e3) / 1e12
+
         routing_desc = (
             f"batch_size={args.batch_size}, active_experts_per_token={args.active_experts_per_token}"
             if args.batch_size is not None
             else f"tokens_per_expert={args.tokens_per_expert}"
         )
-        print(
-            f"{impl:7s}  {ms:9.4f} ms  {tflops:7.3f} TFLOPs   "
+
+        common = (
             f"(experts={experts}, total_routed_tokens={total_routed_tokens}, {routing_desc}, "
             f"embedding_size={embedding_size}, output_features={output_features}, dtype={args.dtype}, seed={args.seed})"
         )
+
+        if args.mode in ("forward", "both"):
+            ms = _time_forward(a, b, offs, iters=args.iters, warmup=args.warmup)
+            flops = 2 * total_routed_tokens * embedding_size * output_features
+            tflops = flops / (ms / 1e3) / 1e12
+            print(f"{impl:7s}  forward  {ms:9.4f} ms  {tflops:7.3f} TFLOPs   {common}")
+
+        if args.mode in ("backward", "both"):
+            compute_grad_a = args.backward in ("da", "both")
+            compute_grad_b = args.backward in ("db", "both")
+            ms = _time_backward_da_db(
+                a,
+                b,
+                offs,
+                grad_out,
+                compute_grad_a=compute_grad_a,
+                compute_grad_b=compute_grad_b,
+                iters=args.iters,
+                warmup=args.warmup,
+            )
+            # Report FLOPs for the subset being computed.
+            flops = 0
+            if compute_grad_a:
+                flops += 2 * total_routed_tokens * embedding_size * output_features
+            if compute_grad_b:
+                flops += 2 * total_routed_tokens * embedding_size * output_features
+            tflops = flops / (ms / 1e3) / 1e12 if flops else 0.0
+            print(f"{impl:7s}  backward {ms:9.4f} ms  {tflops:7.3f} TFLOPs   {common}  backward={args.backward}")
 
 
 if __name__ == "__main__":
