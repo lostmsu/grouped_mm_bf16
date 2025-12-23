@@ -99,7 +99,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--mode", type=str, default="forward", choices=["forward", "backward", "both"])
     parser.add_argument("--backward", type=str, default="both", choices=["da", "db", "both"])
-    parser.add_argument("--impl", type=str, default="both", choices=["tiled", "hybrid", "rowwise", "both"])
+    parser.add_argument("--impl", type=str, default="both", choices=["prologue", "rowwise", "both"])
     parser.add_argument("--block-m", type=int, default=None)
     parser.add_argument("--block-n", type=int, default=None)
     parser.add_argument("--block-k", type=int, default=None)
@@ -142,9 +142,7 @@ def main() -> None:
     b = torch.randn((experts, embedding_size, output_features), device=dev, dtype=dtype)
     grad_out = torch.randn((total_routed_tokens, output_features), device=dev, dtype=dtype)
 
-    if args.impl == "hybrid":
-        args.impl = "tiled"
-    impls = [args.impl] if args.impl != "both" else ["rowwise", "tiled"]
+    impls = [args.impl] if args.impl != "both" else ["rowwise", "prologue"]
     for impl in impls:
         for key in (
             "GROUPED_MM_2D3D_IMPL",

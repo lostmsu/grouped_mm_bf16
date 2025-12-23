@@ -148,6 +148,30 @@ def _grads(loss_out: torch.Tensor, inputs: list[torch.Tensor]) -> list[torch.Ten
     return [g.detach() for g in grads]
 
 
+class _Env:
+    def __init__(self, **items: str):
+        self._items = items
+        self._prev: dict[str, str | None] = {}
+
+    def __enter__(self):
+        import os
+
+        for k, v in self._items.items():
+            self._prev[k] = os.environ.get(k)
+            os.environ[k] = v
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        import os
+
+        for k, prev in self._prev.items():
+            if prev is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = prev
+        return False
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
 def test_grouped_mm_backward_3d3d_float32_matches_bmm():
     dev = _device()
@@ -257,6 +281,98 @@ def test_grouped_mm_backward_2d3d_bf16_matches_reference_with_zero_groups():
     torch.testing.assert_close(da1, da2, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(db1, db2, atol=5e-2, rtol=5e-2)
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
+@pytest.mark.parametrize(
+    "sizes_list,block_m",
+    [
+        # All experts aligned to block boundary -> prologue kernel should do nothing.
+        ([32, 32, 32], 32),
+        # Multi-boundary in one tile: 3 experts inside first 32-row tile.
+        ([10, 10, 10, 2], 32),
+        # Tiny experts (including many within a tile), with empties interspersed.
+        ([1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0], 32),
+        # Starts and ends mid-block for the same expert; also includes empty experts.
+        ([5, 0, 7, 0, 3, 9], 32),
+    ],
+)
+def test_grouped_mm_2d3d_prologue_forward_matches_reference(sizes_list, block_m):
+    dev = _device()
+    if not _bf16_supported():
+        pytest.skip("bf16 not supported on this device")
+    g = len(sizes_list)
+    k, n = 33, 29
+    sizes = torch.tensor(sizes_list, device=dev, dtype=torch.int32)
+    offs = sizes.cumsum(0).to(torch.int32)
+    m_total = int(offs[-1].item())
+    if m_total == 0:
+        pytest.skip("degenerate all-empty case")
+
+    a = torch.randn((m_total, k), device=dev, dtype=torch.bfloat16)
+    b = torch.randn((g, k, n), device=dev, dtype=torch.bfloat16)
+
+    with _Env(
+        GROUPED_MM_2D3D_IMPL="prologue",
+        GROUPED_MM_2D3D_BLOCK_M=str(block_m),
+        GROUPED_MM_2D3D_BLOCK_N="64",
+        GROUPED_MM_2D3D_BLOCK_K="32",
+        GROUPED_MM_2D3D_NUM_WARPS="4",
+    ):
+        out = grouped_mm(a, b, offs=offs)
+
+    rows = torch.arange(m_total, device=dev, dtype=torch.int32)
+    gid = torch.searchsorted(offs, rows, right=True).to(torch.int64)
+    ref = torch.bmm(a.unsqueeze(1), b.index_select(0, gid)).squeeze(1)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
+@pytest.mark.parametrize(
+    "sizes_list,block_m",
+    [
+        # Boundary tile where expert start is aligned (no prologue) + trailing partial tile.
+        ([32, 1, 31], 32),
+        # Cross-boundary expert: starts mid-block and spans into next block(s).
+        ([11, 90, 7], 32),
+        # Swiss-cheese offsets: consecutive empty experts around small experts.
+        ([0, 3, 0, 0, 5, 0, 1, 0, 9], 32),
+    ],
+)
+def test_grouped_mm_2d3d_prologue_backward_da_matches_reference(sizes_list, block_m):
+    dev = _device()
+    g = len(sizes_list)
+    k, n = 41, 37
+    sizes = torch.tensor(sizes_list, device=dev, dtype=torch.int32)
+    offs = sizes.cumsum(0).to(torch.int32)
+    m_total = int(offs[-1].item())
+    if m_total == 0:
+        pytest.skip("degenerate all-empty case")
+
+    a0 = torch.randn((m_total, k), device=dev, dtype=torch.float32)
+    b0 = torch.randn((g, k, n), device=dev, dtype=torch.float32)
+
+    with _Env(
+        GROUPED_MM_2D3D_IMPL="prologue",
+        GROUPED_MM_2D3D_BLOCK_M=str(block_m),
+        GROUPED_MM_2D3D_BLOCK_N="64",
+        GROUPED_MM_2D3D_BLOCK_K="32",
+        GROUPED_MM_2D3D_NUM_WARPS="4",
+    ):
+        a1 = a0.clone().requires_grad_(True)
+        b1 = b0.clone().requires_grad_(True)
+        out1 = grouped_mm(a1, b1, offs=offs)
+        w = torch.randn_like(out1)
+        da1, db1 = _grads((out1 * w).sum(), [a1, b1])
+
+    a2 = a0.clone().requires_grad_(True)
+    b2 = b0.clone().requires_grad_(True)
+    rows = torch.arange(m_total, device=dev, dtype=torch.int32)
+    gid = torch.searchsorted(offs, rows, right=True).to(torch.int64)
+    out2 = torch.bmm(a2.unsqueeze(1), b2.index_select(0, gid)).squeeze(1)
+    da2, db2 = _grads((out2 * w).sum(), [a2, b2])
+
+    torch.testing.assert_close(da1, da2, atol=6e-4, rtol=6e-4)
+    torch.testing.assert_close(db1, db2, atol=8e-4, rtol=8e-4)
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
 def test_grouped_mm_backward_3d2d_float32_matches_reference_with_zero_groups():
