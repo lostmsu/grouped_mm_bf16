@@ -172,6 +172,65 @@ class _Env:
         return False
 
 
+def _torch_grouped_mm():
+    try:
+        import torch.nn.functional as F
+
+        fn = getattr(F, "grouped_mm", None)
+        return fn
+    except Exception:
+        return None
+
+
+def _maybe_compare_to_torch_grouped_mm(
+    out: torch.Tensor, mat_a: torch.Tensor, mat_b: torch.Tensor, offs: torch.Tensor
+) -> None:
+    fn = _torch_grouped_mm()
+    if fn is None:
+        return
+    try:
+        out_torch = fn(mat_a=mat_a, mat_b=mat_b, offs=offs, bias=None, out_dtype=mat_a.dtype)
+    except TypeError:
+        return
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "not implemented" in msg or "not supported" in msg:
+            return
+        raise
+    if not out_torch.is_cuda:
+        return
+    torch.testing.assert_close(out, out_torch, atol=2e-2, rtol=2e-2)
+
+
+def _maybe_compare_grads_to_torch_grouped_mm(
+    da: torch.Tensor,
+    db: torch.Tensor,
+    a0: torch.Tensor,
+    b0: torch.Tensor,
+    offs: torch.Tensor,
+    w: torch.Tensor,
+) -> None:
+    fn = _torch_grouped_mm()
+    if fn is None:
+        return
+    a2 = a0.clone().requires_grad_(True)
+    b2 = b0.clone().requires_grad_(True)
+    try:
+        out2 = fn(mat_a=a2, mat_b=b2, offs=offs, bias=None, out_dtype=a2.dtype)
+    except TypeError:
+        return
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "not implemented" in msg or "not supported" in msg:
+            return
+        raise
+    if not out2.is_cuda:
+        return
+    da2, db2 = _grads((out2 * w).sum(), [a2, b2])
+    torch.testing.assert_close(da, da2, atol=6e-4, rtol=6e-4)
+    torch.testing.assert_close(db, db2, atol=8e-4, rtol=8e-4)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
 def test_grouped_mm_backward_3d3d_float32_matches_bmm():
     dev = _device()
@@ -290,6 +349,13 @@ def test_grouped_mm_backward_2d3d_bf16_matches_reference_with_zero_groups():
         ([32, 32, 32], 32),
         # Multi-boundary in one tile: 3 experts inside first 32-row tile.
         ([10, 10, 10, 2], 32),
+        # Single-token expert ending exactly on a tile boundary.
+        ([31, 1, 31], 32),
+        # Total tokens not divisible by BLOCK_M, and the final partial tile contains multiple experts.
+        # Tile [64..95) includes boundaries at 70 and 80.
+        ([40, 30, 10, 7], 32),
+        # Empty-only tail experts.
+        ([32, 16, 0, 0, 0], 32),
         # Tiny experts (including many within a tile), with empties interspersed.
         ([1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0], 32),
         # Starts and ends mid-block for the same expert; also includes empty experts.
@@ -324,14 +390,17 @@ def test_grouped_mm_2d3d_prologue_forward_matches_reference(sizes_list, block_m)
     gid = torch.searchsorted(offs, rows, right=True).to(torch.int64)
     ref = torch.bmm(a.unsqueeze(1), b.index_select(0, gid)).squeeze(1)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+    _maybe_compare_to_torch_grouped_mm(out, a, b, offs)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
 @pytest.mark.parametrize(
     "sizes_list,block_m",
     [
-        # Boundary tile where expert start is aligned (no prologue) + trailing partial tile.
-        ([32, 1, 31], 32),
+        # Total tokens not divisible by BLOCK_M, and the final partial tile contains multiple experts.
+        ([32, 1, 30], 32),
+        # Single-token expert ending exactly on a tile boundary.
+        ([31, 1, 31], 32),
         # Cross-boundary expert: starts mid-block and spans into next block(s).
         ([11, 90, 7], 32),
         # Swiss-cheese offsets: consecutive empty experts around small experts.
@@ -348,31 +417,34 @@ def test_grouped_mm_2d3d_prologue_backward_da_matches_reference(sizes_list, bloc
     if m_total == 0:
         pytest.skip("degenerate all-empty case")
 
-    a0 = torch.randn((m_total, k), device=dev, dtype=torch.float32)
-    b0 = torch.randn((g, k, n), device=dev, dtype=torch.float32)
+    for seed in (0, 1):
+        torch.manual_seed(seed)
+        a0 = torch.randn((m_total, k), device=dev, dtype=torch.float32)
+        b0 = torch.randn((g, k, n), device=dev, dtype=torch.float32)
 
-    with _Env(
-        GROUPED_MM_2D3D_IMPL="prologue",
-        GROUPED_MM_2D3D_BLOCK_M=str(block_m),
-        GROUPED_MM_2D3D_BLOCK_N="64",
-        GROUPED_MM_2D3D_BLOCK_K="32",
-        GROUPED_MM_2D3D_NUM_WARPS="4",
-    ):
-        a1 = a0.clone().requires_grad_(True)
-        b1 = b0.clone().requires_grad_(True)
-        out1 = grouped_mm(a1, b1, offs=offs)
-        w = torch.randn_like(out1)
-        da1, db1 = _grads((out1 * w).sum(), [a1, b1])
+        with _Env(
+            GROUPED_MM_2D3D_IMPL="prologue",
+            GROUPED_MM_2D3D_BLOCK_M=str(block_m),
+            GROUPED_MM_2D3D_BLOCK_N="64",
+            GROUPED_MM_2D3D_BLOCK_K="32",
+            GROUPED_MM_2D3D_NUM_WARPS="4",
+        ):
+            a1 = a0.clone().requires_grad_(True)
+            b1 = b0.clone().requires_grad_(True)
+            out1 = grouped_mm(a1, b1, offs=offs)
+            w = torch.randn_like(out1)
+            da1, db1 = _grads((out1 * w).sum(), [a1, b1])
 
-    a2 = a0.clone().requires_grad_(True)
-    b2 = b0.clone().requires_grad_(True)
-    rows = torch.arange(m_total, device=dev, dtype=torch.int32)
-    gid = torch.searchsorted(offs, rows, right=True).to(torch.int64)
-    out2 = torch.bmm(a2.unsqueeze(1), b2.index_select(0, gid)).squeeze(1)
-    da2, db2 = _grads((out2 * w).sum(), [a2, b2])
+        a2 = a0.clone().requires_grad_(True)
+        b2 = b0.clone().requires_grad_(True)
+        rows = torch.arange(m_total, device=dev, dtype=torch.int32)
+        gid = torch.searchsorted(offs, rows, right=True).to(torch.int64)
+        out2 = torch.bmm(a2.unsqueeze(1), b2.index_select(0, gid)).squeeze(1)
+        da2, db2 = _grads((out2 * w).sum(), [a2, b2])
 
-    torch.testing.assert_close(da1, da2, atol=6e-4, rtol=6e-4)
-    torch.testing.assert_close(db1, db2, atol=8e-4, rtol=8e-4)
+        torch.testing.assert_close(da1, da2, atol=6e-4, rtol=6e-4)
+        torch.testing.assert_close(db1, db2, atol=8e-4, rtol=8e-4)
+        _maybe_compare_grads_to_torch_grouped_mm(da1, db1, a0, b0, offs, w)
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
 def test_grouped_mm_backward_3d2d_float32_matches_reference_with_zero_groups():
