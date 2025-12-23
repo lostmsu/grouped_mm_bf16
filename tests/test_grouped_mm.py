@@ -211,6 +211,11 @@ def _maybe_compare_grads_to_torch_grouped_mm(
     b0: torch.Tensor,
     offs: torch.Tensor,
     w: torch.Tensor,
+    *,
+    atol_da: float = 6e-4,
+    rtol_da: float = 6e-4,
+    atol_db: float = 8e-4,
+    rtol_db: float = 8e-4,
 ) -> None:
     return # PyTorch grouped_mm does not support our funky shapes
     fn = _torch_grouped_mm()
@@ -230,8 +235,8 @@ def _maybe_compare_grads_to_torch_grouped_mm(
     if not out2.is_cuda:
         return
     da2, db2 = _grads((out2 * w).sum(), [a2, b2])
-    torch.testing.assert_close(da, da2, atol=6e-4, rtol=6e-4)
-    torch.testing.assert_close(db, db2, atol=8e-4, rtol=8e-4)
+    torch.testing.assert_close(da.to(torch.float32), da2.to(torch.float32), atol=atol_da, rtol=rtol_da)
+    torch.testing.assert_close(db.to(torch.float32), db2.to(torch.float32), atol=atol_db, rtol=rtol_db)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
@@ -448,6 +453,75 @@ def test_grouped_mm_2d3d_prologue_backward_da_matches_reference(sizes_list, bloc
         torch.testing.assert_close(da1, da2, atol=6e-4, rtol=6e-4)
         torch.testing.assert_close(db1, db2, atol=8e-4, rtol=8e-4)
         _maybe_compare_grads_to_torch_grouped_mm(da1, db1, a0, b0, offs, w)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
+@pytest.mark.parametrize(
+    "sizes_list,block_m",
+    [
+        # Total tokens not divisible by BLOCK_M, and the final partial tile contains multiple experts.
+        ([32, 1, 30], 32),
+        # Single-token expert ending exactly on a tile boundary.
+        ([31, 1, 31], 32),
+        # Cross-boundary expert: starts mid-block and spans into next block(s).
+        ([11, 90, 7], 32),
+        # Swiss-cheese offsets: consecutive empty experts around small experts.
+        ([0, 3, 0, 0, 5, 0, 1, 0, 9], 32),
+    ],
+)
+def test_grouped_mm_2d3d_prologue_backward_bf16_matches_reference(sizes_list, block_m):
+    if not _bf16_supported():
+        pytest.skip("bf16 not supported on this device")
+    dev = _device()
+    g = len(sizes_list)
+    k, n = 41, 37
+    sizes = torch.tensor(sizes_list, device=dev, dtype=torch.int32)
+    offs = sizes.cumsum(0).to(torch.int32)
+    m_total = int(offs[-1].item())
+    if m_total == 0:
+        pytest.skip("degenerate all-empty case")
+
+    for seed in (0, 1):
+        torch.manual_seed(seed)
+        a0 = torch.randn((m_total, k), device=dev, dtype=torch.bfloat16)
+        b0 = torch.randn((g, k, n), device=dev, dtype=torch.bfloat16)
+
+        with _Env(
+            GROUPED_MM_2D3D_IMPL="prologue",
+            GROUPED_MM_2D3D_BLOCK_M=str(block_m),
+            GROUPED_MM_2D3D_BLOCK_N="64",
+            GROUPED_MM_2D3D_BLOCK_K="32",
+            GROUPED_MM_2D3D_NUM_WARPS="4",
+        ):
+            a1 = a0.clone().requires_grad_(True)
+            b1 = b0.clone().requires_grad_(True)
+            out1 = grouped_mm(a1, b1, offs=offs)
+            w = torch.randn_like(out1)
+            da1, db1 = _grads((out1 * w).sum(), [a1, b1])
+
+        a2 = a0.clone().requires_grad_(True)
+        b2 = b0.clone().requires_grad_(True)
+        rows = torch.arange(m_total, device=dev, dtype=torch.int32)
+        gid = torch.searchsorted(offs, rows, right=True).to(torch.int64)
+        out2 = torch.bmm(a2.unsqueeze(1), b2.index_select(0, gid)).squeeze(1)
+        da2, db2 = _grads((out2 * w).sum(), [a2, b2])
+
+        torch.testing.assert_close(da1, da2, atol=5e-2, rtol=5e-2)
+        # For bf16 weights, dB can be large (sum over many routed tokens), and bf16 ulp grows with
+        # magnitude (e.g. ulp=0.5 around |x|≈64). Allow a correspondingly larger tolerance.
+        torch.testing.assert_close(db1, db2, atol=6e-1, rtol=1e-1)
+        _maybe_compare_grads_to_torch_grouped_mm(
+            da1,
+            db1,
+            a0,
+            b0,
+            offs,
+            w,
+            atol_da=5e-2,
+            rtol_da=5e-2,
+            atol_db=6e-1,
+            rtol_db=1e-1,
+        )
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
 def test_grouped_mm_backward_3d2d_float32_matches_reference_with_zero_groups():
