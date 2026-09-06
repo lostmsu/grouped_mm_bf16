@@ -854,23 +854,31 @@ def _grouped_mm_2d3d_dB_reduce_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    SPLIT: tl.constexpr = 1,
 ):
     pid_g = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
     pid_n = tl.program_id(axis=2)
 
-    g = pid_g.to(tl.int32)
+    # row-range split: SPLIT CTAs per (g, k, n) tile, each covering a disjoint
+    # chunk of the expert's rows, so one large expert cannot serialize the kernel
+    g = (pid_g // SPLIT).to(tl.int32)
+    s = pid_g % SPLIT
     k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
     n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
     end = tl.load(offs_ptr + g, mask=g < G, other=0).to(tl.int32)
     start = tl.load(offs_ptr + g - 1, mask=g > 0, other=0).to(tl.int32)
 
+    total = end - start
+    chunk = (total + SPLIT - 1) // SPLIT
+    m0 = start + s * chunk
+    mend = tl.minimum(m0 + chunk, end)
+
     acc = tl.zeros((BLOCK_K, BLOCK_N), dtype=tl.float32)
-    m0 = start
-    while m0 < end:
+    while m0 < mend:
         m = m0 + tl.arange(0, BLOCK_M)
-        mask_m = m < end
+        mask_m = m < mend
         aT = tl.load(
             A_ptr + m[None, :] * stride_am + k[:, None] * stride_ak,
             mask=mask_m[None, :] & (k[:, None] < K),
@@ -885,7 +893,11 @@ def _grouped_mm_2d3d_dB_reduce_kernel(
         m0 += BLOCK_M
 
     out_ptr = dB_ptr + g * stride_dbg + k[:, None] * stride_dbk + n[None, :] * stride_dbn
-    tl.store(out_ptr, acc, mask=(g < G) & (k[:, None] < K) & (n[None, :] < N))
+    if SPLIT == 1:
+        tl.store(out_ptr, acc, mask=(g < G) & (k[:, None] < K) & (n[None, :] < N))
+    else:
+        # dB buffer is zero-initialized by the caller
+        tl.atomic_add(out_ptr, acc, mask=(g < G) & (k[:, None] < K) & (n[None, :] < N))
 
 
 @triton.jit
@@ -1231,11 +1243,14 @@ def grouped_mm_2d3d_backward(
     if grad_b is not None:
         dB_fp32 = torch.zeros((G, K, N), device=mat_a.device, dtype=torch.float32)
 
-        # dB[g] = A_g^T @ dC_g (per-expert reduction, avoids ~O(M_total) atomics).
+        # dB[g] = A_g^T @ dC_g (per-expert reduction, row-split across SPLIT
+        # CTAs per tile so imbalanced expert loads cannot serialize the kernel;
+        # partial tiles are combined with fp32 atomics into the zeroed buffer).
         block_m = 64
         block_k = 32
         block_n = 64
-        grid = (G, triton.cdiv(K, block_k), triton.cdiv(N, block_n))
+        split = 8
+        grid = (G * split, triton.cdiv(K, block_k), triton.cdiv(N, block_n))
         _grouped_mm_2d3d_dB_reduce_kernel[grid](
             mat_a,
             grad_out,
@@ -1256,6 +1271,7 @@ def grouped_mm_2d3d_backward(
             BLOCK_M=block_m,
             BLOCK_K=block_k,
             BLOCK_N=block_n,
+            SPLIT=split,
             num_warps=4,
         )
         grad_b.copy_(dB_fp32.to(dtype=grad_b.dtype))
