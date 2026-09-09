@@ -1249,7 +1249,7 @@ def grouped_mm_2d3d_backward(
         block_m = 64
         block_k = 32
         block_n = 64
-        split = 8
+        split = 32
         grid = (G * split, triton.cdiv(K, block_k), triton.cdiv(N, block_n))
         _grouped_mm_2d3d_dB_reduce_kernel[grid](
             mat_a,
